@@ -2,14 +2,14 @@
 """
 Async Pusher Microservice (fail-fast)
 
-Responsibilities:
-- Subscribe to GPIO status (PUB/SUB)
-- Send commands to GPIO service (REQ/REP)
-- Edge-based logic:
-    * sensor1 rising edge AND sensor2 ON  -> pusher1 ON
-    * sensor2 falling edge AND pusher1 ON -> pusher1 OFF
-- Publish heartbeat (1 Hz) via ZMQ PUB
-- Kill process if GPIO heartbeat is lost > 5s
+Contract:
+- sensor1 ↑ :
+    * if sensor2 ON -> pusher1 ON (hold)
+    * else -> pulse while sensor1 ON, ending OFF
+- sensor2 ↓ :
+    * if sensor1 ON and pusher1 ON -> pulse until sensor1 OFF
+- sensor1 ↓ :
+    * always ends with pusher1 OFF (eventually)
 """
 
 from __future__ import annotations
@@ -42,29 +42,23 @@ log = logging.getLogger("pusher")
 
 DEVICE_ID = "pusher"
 
-# ---- GPIO service -----------------------------------------------------------
 GPIO_PUB_ADDR = "tcp://127.0.0.1:5556"
 GPIO_REP_ADDR = "tcp://127.0.0.1:5557"
 GPIO_STATUS_TOPIC = b"gpio.status"
 
-# ---- Heartbeat --------------------------------------------------------------
 HEARTBEAT_PUB_BIND = "tcp://0.0.0.0:5560"
 HEARTBEAT_TOPIC = b"pusher.heartbeat"
 HEARTBEAT_HZ = 1.0
 
-# ---- Watchdog ---------------------------------------------------------------
 GPIO_HEARTBEAT_TIMEOUT_SEC = 5.0
 
-# ---- Pins ------------------------------------------------------------------
 SENSOR_1 = "sensor1"
 SENSOR_2 = "sensor2"
 PUSHER_1 = "pusher1"
 
-
-# --- Timing ------------------------------------------------------------------
 PUSHER_ON_SEC = 0.50
 PUSHER_OFF_SEC = 0.40
-PUSHER_PULSES = 3
+
 
 # =============================================================================
 # STATE
@@ -73,6 +67,9 @@ PUSHER_PULSES = 3
 last_pins: Dict[str, int] | None = None
 pusher1_state: int = 0
 last_gpio_seen_ts: float | None = None
+
+# REQ/REP sockets must not be used concurrently.
+_gpio_lock = asyncio.Lock()
 
 
 # =============================================================================
@@ -91,11 +88,24 @@ def falling_edge(prev: int, curr: int) -> bool:
 async def gpio_set(
     req_sock: zmq.asyncio.Socket, pin: str, value: bool
 ) -> None:
-    req = {"cmd": "set", "pin": pin, "value": value}
-    await req_sock.send_json(req)
-    reply = await req_sock.recv_json()
-    if reply.get("ok") is not True:
-        raise RuntimeError(f"GPIO set failed: {reply}")
+    async with _gpio_lock:
+        req = {"cmd": "set", "pin": pin, "value": value}
+        await req_sock.send_json(req)
+        reply = await req_sock.recv_json()
+        if reply.get("ok") is not True:
+            raise RuntimeError(f"GPIO set failed: {reply}")
+
+
+async def ensure_pusher_off(req_sock: zmq.asyncio.Socket) -> None:
+    global pusher1_state
+    if pusher1_state == 0:
+        return
+    try:
+        await gpio_set(req_sock, PUSHER_1, False)
+    except asyncio.CancelledError:
+        # Best-effort cleanup; do not deadlock shutdown.
+        return
+    pusher1_state = 0
 
 
 # =============================================================================
@@ -104,8 +114,7 @@ async def gpio_set(
 
 
 async def gpio_listener(
-    ctx: zmq.asyncio.Context,
-    gpio_req: zmq.asyncio.Socket,
+    ctx: zmq.asyncio.Context, gpio_req: zmq.asyncio.Socket
 ) -> None:
     global last_pins, pusher1_state, last_gpio_seen_ts
 
@@ -114,6 +123,25 @@ async def gpio_listener(
     sub.setsockopt(zmq.SUBSCRIBE, GPIO_STATUS_TOPIC)
 
     log.info("Subscribed to GPIO status")
+
+    pulse_task: asyncio.Task | None = None
+
+    async def pulse_until_sensor1_off() -> None:
+        global pusher1_state
+        try:
+            while last_pins and last_pins[SENSOR_1] == 1:
+                await gpio_set(gpio_req, PUSHER_1, True)
+                pusher1_state = 1
+                await asyncio.sleep(PUSHER_ON_SEC)
+
+                await gpio_set(gpio_req, PUSHER_1, False)
+                pusher1_state = 0
+                await asyncio.sleep(PUSHER_OFF_SEC)
+        except asyncio.CancelledError:
+            log.debug("pulse task cancelled")
+            raise
+        finally:
+            await ensure_pusher_off(gpio_req)
 
     while True:
         topic, raw = await sub.recv_multipart()
@@ -128,87 +156,64 @@ async def gpio_listener(
         s1 = int(pins[SENSOR_1]["value"])
         s2 = int(pins[SENSOR_2]["value"])
 
-        # ---------------------------------------------------------------------
-        # BASELINE QUALIFICATION
-        # ---------------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Baseline qualification
+        # ------------------------------------------------------------------
         if last_pins is None:
             if s1 == 0 and s2 == 0:
-                last_pins = {
-                    SENSOR_1: s1,
-                    SENSOR_2: s2,
-                }
-                log.info("Baseline established (sensors idle)")
+                last_pins = {SENSOR_1: s1, SENSOR_2: s2}
+                log.info("Baseline established")
             continue
 
-        # ---------------------------------------------------------------------
-        # Rule 1:
-        # sensor1 ↑ AND sensor2 ON -> pusher1 ON
-        # if downstream clear (sensor2 OFF), immediately release
-        # ---------------------------------------------------------------------
-
+        # ------------------------------------------------------------------
+        # sensor1 ↑
+        # ------------------------------------------------------------------
         if rising_edge(last_pins[SENSOR_1], s1):
-            if pusher1_state == 0:
-                log.info("sensor1 ↑ -> pusher1 PULSE x3")
+            if pulse_task:
+                pulse_task.cancel()
+                pulse_task = None
+                await ensure_pusher_off(gpio_req)
 
-                # --- 3 pulses ---
-                for i in range(PUSHER_PULSES):
-                    log.info("pusher1 ON (pulse %d)", i + 1)
-                    await gpio_set(gpio_req, PUSHER_1, True)
-                    pusher1_state = 1
-                    await asyncio.sleep(PUSHER_ON_SEC)
+            if s2 == 1:
+                log.info("sensor1 ↑ with sensor2 ON -> HOLD")
+                await gpio_set(gpio_req, PUSHER_1, True)
+                pusher1_state = 1
+            else:
+                log.info("sensor1 ↑ with sensor2 OFF -> PULSE")
+                pulse_task = asyncio.create_task(pulse_until_sensor1_off())
 
-                    log.info("pusher1 OFF (pulse %d)", i + 1)
-                    await gpio_set(gpio_req, PUSHER_1, False)
-                    pusher1_state = 0
-
-                    if i < PUSHER_PULSES - 1:
-                        await asyncio.sleep(PUSHER_OFF_SEC)
-
-                # --- final state decision ---
-                if s2 == 1:
-                    log.info(
-                        "downstream blocked (sensor2 ON) -> holding pusher1 ON"
-                    )
-                    await gpio_set(gpio_req, PUSHER_1, True)
-                    pusher1_state = 1
-                else:
-                    log.info(
-                        "downstream clear (sensor2 OFF) -> pusher1 remains OFF"
-                    )
-
-        # ---------------------------------------------------------------------
-        # Rule 2:
-        # sensor2 ↓ AND pusher1 ON -> pusher1 OFF
-        # ---------------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # sensor2 ↓
+        # ------------------------------------------------------------------
         if falling_edge(last_pins[SENSOR_2], s2):
-            if pusher1_state == 1:
-                log.info("sensor2 ↓ and pusher1 ON -> pusher1 OFF")
-                await gpio_set(gpio_req, PUSHER_1, False)
-                pusher1_state = 0
+            if last_pins[SENSOR_1] == 1 and pusher1_state == 1:
+                log.info("sensor2 ↓ -> HOLD → PULSE")
+                if pulse_task:
+                    pulse_task.cancel()
+                pulse_task = asyncio.create_task(pulse_until_sensor1_off())
+
+        # ------------------------------------------------------------------
+        # sensor1 ↓
+        # ------------------------------------------------------------------
+        if falling_edge(last_pins[SENSOR_1], s1):
+            if pulse_task:
+                pulse_task.cancel()
+                pulse_task = None
+            await ensure_pusher_off(gpio_req)
 
         last_pins[SENSOR_1] = s1
         last_pins[SENSOR_2] = s2
 
 
 async def gpio_watchdog() -> None:
-    """
-    Kill process if GPIO heartbeat disappears.
-    """
     global last_gpio_seen_ts
 
     while True:
         await asyncio.sleep(0.5)
-
         if last_gpio_seen_ts is None:
             continue
-
-        delta = time.monotonic() - last_gpio_seen_ts
-        if delta > GPIO_HEARTBEAT_TIMEOUT_SEC:
-            log.critical(
-                "GPIO heartbeat lost (%.2fs > %.2fs). Exiting.",
-                delta,
-                GPIO_HEARTBEAT_TIMEOUT_SEC,
-            )
+        if time.monotonic() - last_gpio_seen_ts > GPIO_HEARTBEAT_TIMEOUT_SEC:
+            log.critical("GPIO heartbeat lost")
             sys.exit(1)
 
 
@@ -225,14 +230,12 @@ async def heartbeat_publisher(ctx: zmq.asyncio.Context) -> None:
             "device_id": DEVICE_ID,
             "ts_ms": int(time.time() * 1000),
         }
-
         await pub.send_multipart(
             [
                 HEARTBEAT_TOPIC,
                 json.dumps(payload, separators=(",", ":")).encode("utf-8"),
             ]
         )
-
         await asyncio.sleep(period)
 
 
@@ -253,13 +256,14 @@ async def _amain() -> None:
         asyncio.create_task(
             gpio_listener(ctx, gpio_req), name="gpio_listener"
         ),
-        asyncio.create_task(heartbeat_publisher(ctx), name="heartbeat"),
+        asyncio.create_task(
+            heartbeat_publisher(ctx), name="heartbeat_publisher"
+        ),
         asyncio.create_task(gpio_watchdog(), name="gpio_watchdog"),
     ]
 
     done, pending = await asyncio.wait(
-        tasks,
-        return_when=asyncio.FIRST_EXCEPTION,
+        tasks, return_when=asyncio.FIRST_EXCEPTION
     )
 
     for task in done:
@@ -279,7 +283,6 @@ def main() -> None:
     try:
         asyncio.run(_amain())
     except KeyboardInterrupt:
-        log.exception("Service interrupted (KeyboardInterrupt)")
         sys.exit(1)
     except Exception:
         log.exception("Service crashed")
