@@ -63,8 +63,6 @@ MQTT_TOPIC_STATE = "lucid/boxturner/state"
 # TIMEOUTS
 # =============================================================================
 
-STARTUP_TIMEOUT_SEC = 3.0
-RECV_TIMEOUT_MS = 500
 HEALTH_TIMEOUT_SEC = 5.0
 BOX_MISSING_TIMEOUT_SEC = 10.0
 
@@ -73,10 +71,11 @@ BOX_MISSING_TIMEOUT_SEC = 10.0
 # TIMING CONFIG
 # =============================================================================
 
-ARM_SETTLE_DELAY_SEC = 0.5  # Time for arm to move into position
+ARM_SETTLE_DELAY_SEC = 0.5
 VACUUM_HOLD_DELAY_SEC = 1.0
 POST_MEASUREMENT_DELAY_SEC = 0.5
-RUNNING_RESET_DELAY_SEC = 1.0  # After sensor3 down, time to running=False
+RUNNING_RESET_DELAY_SEC = 1.0
+PUSHER2_HOLD_TIME_SEC = 1.0
 
 
 # =============================================================================
@@ -109,8 +108,6 @@ health_main: bool = True
 health_gpio: bool = True
 health_pusher: bool = True
 
-# When pusher2 is released into the measurement zone, we start a deadline
-# expecting sensor3 to rise. If it doesn't, the box went missing.
 box_expected_by_ts: float | None = None
 
 
@@ -171,14 +168,14 @@ async def publish_state_if_changed(
     if compare_state == last_published_state:
         return
 
-    publish_state = {
+    payload = {
         "ts_ms": int(time.time() * 1000),
         **compare_state,
     }
 
     await mqtt.publish(
         MQTT_TOPIC_STATE,
-        json.dumps(publish_state, separators=(",", ":")),
+        json.dumps(payload, separators=(",", ":")),
         qos=0,
         retain=True,
     )
@@ -187,7 +184,7 @@ async def publish_state_if_changed(
 
 
 # =============================================================================
-# WATCHDOG
+# WATCHDOGS
 # =============================================================================
 
 
@@ -198,13 +195,14 @@ async def health_watchdog(mqtt: aiomqtt.Client) -> None:
         await asyncio.sleep(0.5)
         now = time.monotonic()
 
-        if last_gpio_seen_ts is not None:
-            if now - last_gpio_seen_ts > HEALTH_TIMEOUT_SEC:
-                health_gpio = False
+        if last_gpio_seen_ts and now - last_gpio_seen_ts > HEALTH_TIMEOUT_SEC:
+            health_gpio = False
 
-        if last_pusher_seen_ts is not None:
-            if now - last_pusher_seen_ts > HEALTH_TIMEOUT_SEC:
-                health_pusher = False
+        if (
+            last_pusher_seen_ts
+            and now - last_pusher_seen_ts > HEALTH_TIMEOUT_SEC
+        ):
+            health_pusher = False
 
         if not health_gpio or not health_pusher:
             health_main = False
@@ -217,39 +215,54 @@ async def box_missing_watchdog(
     mqtt: aiomqtt.Client,
     gpio_req: zmq.asyncio.Socket,
 ) -> None:
-    """
-    If pusher2 has been released into the measurement zone and sensor3 does not
-    go high in time, assume the box is missing. Safely stop the cycle:
-
-    - ARM OFF
-    - running = False
-    - clear expectation
-    """
     global box_expected_by_ts, running
 
     while True:
         await asyncio.sleep(0.1)
+
         if box_expected_by_ts is None:
             continue
 
-        now = time.monotonic()
-        if now <= box_expected_by_ts:
+        if time.monotonic() <= box_expected_by_ts:
             continue
 
-        log.error(
-            "Box missing: sensor3 did not rise within %.1fs. "
-            "Stopping cycle.",
-            BOX_MISSING_TIMEOUT_SEC,
-        )
+        log.error("Box missing: sensor3 timeout")
 
-        # Safe stop
         await gpio_set(gpio_req, ARM, False)
         await asyncio.sleep(RUNNING_RESET_DELAY_SEC)
         running = False
+        log.info("Running=False")
         box_expected_by_ts = None
 
         await publish_state_if_changed(mqtt, last_gpio_values or {})
-        # Continue running service; this is not a fatal crash.
+
+
+# =============================================================================
+# MEASUREMENT SEQUENCE
+# =============================================================================
+
+
+async def start_measurement_sequence(
+    req: zmq.asyncio.Socket,
+    mqtt: aiomqtt.Client,
+) -> None:
+    global running, horizontal, box_expected_by_ts
+
+    await gpio_set(req, PUSHER2, True)
+
+    if running:
+        return
+
+    running = True
+    log.info("Running=True")
+    await publish_state_if_changed(mqtt, last_gpio_values or {})
+
+    await gpio_set(req, ARM, True)
+    await asyncio.sleep(PUSHER2_HOLD_TIME_SEC)
+    await gpio_set(req, PUSHER2, False)
+
+    horizontal = measure_horizontal()
+    box_expected_by_ts = time.monotonic() + BOX_MISSING_TIMEOUT_SEC
 
 
 # =============================================================================
@@ -271,13 +284,7 @@ async def gpio_listener(
     req = ctx.socket(zmq.REQ)
     req.connect(GPIO_REP_ADDR)
 
-    log.info("Subscribed to GPIO status")
-
-    # Spawn missing-box watchdog once we have the req socket
-    watchdog_task = asyncio.create_task(
-        box_missing_watchdog(mqtt, req),
-        name="box_missing_watchdog",
-    )
+    watchdog = asyncio.create_task(box_missing_watchdog(mqtt, req))
 
     try:
         while True:
@@ -297,57 +304,41 @@ async def gpio_listener(
                 await publish_state_if_changed(mqtt, gpio_values)
                 continue
 
-            # -----------------------------------------------------------------
-            # sensor2 ↑ -> start / queue logic
-            # -----------------------------------------------------------------
             if rising_edge(last_gpio_values[SENSOR2], s2):
-                log.info("EVENT: sensor2 ↑")
-                await start_measurement_sequence(req)
+                await start_measurement_sequence(req, mqtt)
 
-            # -----------------------------------------------------------------
-            # sensor3 ↑ -> diagonal station reached (box is present)
-            # Clear missing-box expectation for current cycle.
-            # -----------------------------------------------------------------
             if rising_edge(last_gpio_values[SENSOR3], s3):
-                log.info("EVENT: sensor3 ↑")
                 box_expected_by_ts = None
-
                 diagonal = measure_diagonal()
 
                 if horizontal is None:
-                    log.warning("No horizontal recorded")
                     await asyncio.sleep(POST_MEASUREMENT_DELAY_SEC)
                     await gpio_set(req, ARM, False)
-
                 elif diagonal > horizontal:
                     await gpio_set(req, VACUUM, True)
                     await gpio_set(req, ARM, False)
                     await asyncio.sleep(VACUUM_HOLD_DELAY_SEC)
                     await gpio_set(req, VACUUM, False)
-
                 else:
                     await asyncio.sleep(POST_MEASUREMENT_DELAY_SEC)
                     await gpio_set(req, ARM, False)
 
-            # -----------------------------------------------------------------
-            # sensor3 ↓ -> box leaves system
-            # -----------------------------------------------------------------
             if falling_edge(last_gpio_values[SENSOR3], s3):
-                log.info("EVENT: sensor3 ↓")
                 await asyncio.sleep(RUNNING_RESET_DELAY_SEC)
                 running = False
+                log.info("Running=False")
                 box_expected_by_ts = None
+                await publish_state_if_changed(mqtt, gpio_values)
 
-                # Queued box at pusher2
                 if s2 == 1:
-                    await start_measurement_sequence(req)
+                    await start_measurement_sequence(req, mqtt)
 
             last_gpio_values = gpio_values.copy()
             await publish_state_if_changed(mqtt, gpio_values)
 
     finally:
-        watchdog_task.cancel()
-        await asyncio.gather(watchdog_task, return_exceptions=True)
+        watchdog.cancel()
+        await asyncio.gather(watchdog, return_exceptions=True)
 
 
 # =============================================================================
@@ -365,41 +356,6 @@ async def pusher_listener(ctx: zmq.asyncio.Context) -> None:
     while True:
         await sub.recv_multipart()
         last_pusher_seen_ts = time.monotonic()
-
-
-# =============================================================================
-# MEASUREMENT SEQUENCE
-# =============================================================================
-
-
-async def start_measurement_sequence(req: zmq.asyncio.Socket) -> None:
-    """
-    Sequence:
-
-    1) Stop box at pusher2
-    2) If already running, do nothing else (box is queued)
-    3) Else:
-       - running = True
-       - arm ON, settle
-       - pusher2 OFF (release into measurement zone)
-       - measure horizontal
-       - start missing-box deadline waiting for sensor3 ↑
-    """
-    global running, horizontal, box_expected_by_ts
-
-    await gpio_set(req, PUSHER2, True)
-
-    if running:
-        return
-
-    running = True
-    await gpio_set(req, ARM, True)
-    await asyncio.sleep(ARM_SETTLE_DELAY_SEC)
-    await gpio_set(req, PUSHER2, False)
-
-    horizontal = measure_horizontal()
-
-    box_expected_by_ts = time.monotonic() + BOX_MISSING_TIMEOUT_SEC
 
 
 # =============================================================================

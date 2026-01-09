@@ -54,6 +54,8 @@ PIN_FACTORY = MockFactory()
 OUTPUT_PINS = {
     "pusher1": {"pin": 17, "active_high": True, "initial": False},
     "pusher2": {"pin": 18, "active_high": True, "initial": False},
+    "pusher3": {"pin": 23, "active_high": True, "initial": False},
+    "pusher4": {"pin": 24, "active_high": True, "initial": False},
     "vacuum": {"pin": 27, "active_high": True, "initial": False},
     "arm": {"pin": 22, "active_high": True, "initial": False},
 }
@@ -62,6 +64,8 @@ INPUT_PINS = {
     "sensor1": {"pin": 5, "pull_up": False},
     "sensor2": {"pin": 6, "pull_up": False},
     "sensor3": {"pin": 13, "pull_up": False},
+    "sensor4": {"pin": 21, "pull_up": False},
+    "sensor5": {"pin": 19, "pull_up": False},
 }
 
 

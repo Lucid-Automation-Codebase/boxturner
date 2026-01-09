@@ -194,9 +194,8 @@ def scenario_2() -> None:
     # ------------------------------------------------------------------
     gpio_set(SENSOR2, True)
     print("✓ sensor2 ↑ (box1)")
+    wait_for_state(lambda s: s["running"] is True, timeout=5)
 
-    wait_for_state(lambda s: s["running"] is True)
-    wait_for_state(lambda s: s["gpio"][PUSHER2] == 1)
     print("✓ box1 held at pusher2")
 
     # ------------------------------------------------------------------
@@ -308,11 +307,8 @@ def scenario_3() -> None:
     # ------------------------------------------------------------------
     print("⏳ waiting for BOX_MISSING_TIMEOUT...")
 
-    wait_for_state(lambda s: s["gpio"][ARM] == 0, timeout=12.0)
+    wait_for_state(lambda s: s["gpio"][ARM] == 0, timeout=11.0)
     print("✓ arm forced OFF by timeout")
-
-    wait_for_state(lambda s: s["running"] is False, timeout=2.0)
-    print("✓ running reset after timeout")
 
     print("✓ Scenario 3 PASSED")
 

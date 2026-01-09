@@ -18,6 +18,7 @@ packages = [{ include = "boxturner", from = "src" }]
 [tool.poetry.scripts]
 boxturner-gpio = "boxturner.gpio:main"
 boxturner-pusher = "boxturner.pusher:main"
+boxturner-main = "boxturner.main:main"
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
