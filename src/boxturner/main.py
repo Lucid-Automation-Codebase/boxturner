@@ -16,6 +16,7 @@ from typing import Any, Dict
 import aiomqtt
 import zmq
 import zmq.asyncio
+from boxturner.sensor import SensorReader
 
 
 # =============================================================================
@@ -85,6 +86,13 @@ PUSHER2 = "pusher2"
 ARM = "arm"
 VACUUM = "vacuum"
 
+HORIZONTAL_UART = 13
+DIAGONAL_UART = 12
+
+distance_sensor = SensorReader(HORIZONTAL_UART, DIAGONAL_UART)
+
+SENSOR_TIMEOUT = 3.0
+
 
 # =============================================================================
 # STATE
@@ -124,22 +132,30 @@ def falling_edge(prev: int, curr: int) -> bool:
     return prev == 1 and curr == 0
 
 
-def measure_horizontal() -> int | None:
-    if random.random() < 0.05:
-        log.error("Horizontal measurement failed")
+async def measure_horizontal() -> int | None:
+    try:
+        val = await asyncio.wait_for(
+            asyncio.to_thread(distance_sensor.read_data, HORIZONTAL_UART),
+            timeout=SENSOR_TIMEOUT,
+        )
+        log.info("Measured horizontal = %d", val)
+        return val
+    except asyncio.TimeoutError:
+        log.warning("Horizontal measurement timed out")
         return None
-    val = random.randint(10, 100)
-    log.info("Measured horizontal = %d", val)
-    return val
 
 
-def measure_diagonal() -> int | None:
-    if random.random() < 0.05:
-        log.error("Diagonal measurement failed")
+async def measure_diagonal() -> int | None:
+    try:
+        val = await asyncio.wait_for(
+            asyncio.to_thread(distance_sensor.read_data, DIAGONAL_UART),
+            timeout=SENSOR_TIMEOUT,
+        )
+        log.info("Measured diagonal = %d", val)
+        return val
+    except asyncio.TimeoutError:
+        log.warning("Diagonal measurement timed out")
         return None
-    val = random.randint(10, 100)
-    log.info("Measured diagonal = %d", val)
-    return val
 
 
 async def gpio_set(sock: zmq.asyncio.Socket, pin: str, value: bool) -> None:
@@ -316,7 +332,7 @@ async def start_measurement_sequence(
     await asyncio.sleep(PUSHER2_HOLD_TIME_SEC)
     await gpio_set(req, PUSHER2, False)
 
-    horizontal = measure_horizontal()
+    horizontal = await measure_horizontal()
     box_expected_by_ts = time.monotonic() + BOX_MISSING_TIMEOUT_SEC
 
 
@@ -373,7 +389,7 @@ async def gpio_listener(
                 if horizontal is None:
                     await reject_and_reset(req, intent_sock)
                 else:
-                    diagonal = measure_diagonal()
+                    diagonal = await measure_diagonal()
                     if diagonal is None:
                         await reject_and_reset(req, intent_sock)
                     elif diagonal > horizontal:
