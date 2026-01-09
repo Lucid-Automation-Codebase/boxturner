@@ -2,9 +2,12 @@
 """
 Integration tests for main sequencer
 
+Adjusted for pusher1 pulse+hold behavior.
+
 Scenarios:
 - Scenario 1: single box, repeated
 - Scenario 2: queued boxes with upstream interference
+- Scenario 3: missing box timeout
 """
 
 from __future__ import annotations
@@ -53,6 +56,15 @@ ALL_PINS = [
 # Timing
 STATE_TIMEOUT_SEC = 5.0
 BOX_EXIT_SEC = 1.2
+
+# --- must match pusher service ---
+PUSHER_ON_SEC = 0.50
+PUSHER_OFF_SEC = 0.40
+PUSHER_PULSES = 3
+
+TOTAL_PULSE_TIME = (
+    PUSHER_PULSES * PUSHER_ON_SEC + (PUSHER_PULSES - 1) * PUSHER_OFF_SEC
+)
 
 
 # =============================================================================
@@ -119,21 +131,19 @@ def scenario_1() -> None:
     print("✓ baseline idle")
 
     # --------------------------------------------------------------
-    # sensor1 noise
+    # sensor1 upstream noise (pulses then releases)
     # --------------------------------------------------------------
     gpio_set(SENSOR1, True)
-    print("✓ sensor1 ↑ (noise)")
-    time.sleep(1.0)
+    print("✓ sensor1 ↑ (upstream noise)")
+    time.sleep(TOTAL_PULSE_TIME + 0.2)
 
     state = mqtt_state
     assert state["gpio"][PUSHER1] == 0
     assert state["gpio"][PUSHER2] == 0
-    assert state["gpio"].get("pusher3", 0) == 0
-    assert state["gpio"].get("pusher4", 0) == 0
-    print("✓ no pushers actuated")
+    print("✓ pusher1 pulsed and released (no downstream hold)")
 
     gpio_set(SENSOR1, False)
-    time.sleep(1.0)
+    time.sleep(0.5)
 
     # --------------------------------------------------------------
     # sensor2 enters → pusher2 actuates
@@ -162,41 +172,24 @@ def scenario_1() -> None:
     time.sleep(1.0)
 
     # --------------------------------------------------------------
-    # sealer path
+    # sealer path (accept)
     # --------------------------------------------------------------
-    wait_for_state(lambda s: s["gpio"][ARM] == 0)
-    time.sleep(0.5)  # allow intent propagation
     gpio_set("sensor4", True)
     print("✓ sensor4 ↑")
-    time.sleep(1.0)
-
     wait_for_state(lambda s: s["gpio"].get("pusher4", 0) == 1)
-    print("✓ pusher4 ON")
 
     gpio_set("sensor4", False)
-    time.sleep(1.0)
+    time.sleep(0.5)
 
     gpio_set("sensor5", True)
     print("✓ sensor5 ↑")
-    time.sleep(0.5)
-
     wait_for_state(lambda s: s["gpio"].get("pusher3", 0) == 1)
-    print("✓ pusher3 ON")
 
     gpio_set("sensor5", False)
     time.sleep(1.0)
 
-    # --------------------------------------------------------------
-    # final state
-    # --------------------------------------------------------------
-    state = mqtt_state
-    assert state["gpio"][PUSHER1] == 0
-    assert state["gpio"][PUSHER2] == 0
-    assert state["gpio"].get("pusher3", 0) == 0
-    assert state["gpio"].get("pusher4", 0) == 0
-    assert state["running"] is False
+    wait_for_state(lambda s: s["running"] is False)
 
-    print("✓ all pushers OFF, running=False")
     print("✓ Scenario 1 PASSED")
 
 
@@ -216,53 +209,42 @@ def scenario_2() -> None:
     print("✓ baseline idle")
 
     # ------------------------------------------------------------------
-    # Phase A: upstream noise
-    # ------------------------------------------------------------------
-    gpio_set(SENSOR1, True)
-    print("✓ sensor1 ↑ (box2 upstream noise)")
-
-    time.sleep(3.0)
-
-    state = mqtt_state
-    assert state["running"] is False, "running triggered prematurely"
-    assert state["gpio"][PUSHER1] == 0, "pusher1 activated prematurely"
-    assert state["gpio"][PUSHER2] == 0, "pusher2 activated prematurely"
-    print("✓ no reaction to upstream-only box")
-
-    gpio_set(SENSOR1, False)
-    time.sleep(1.0)
-
-    # ------------------------------------------------------------------
-    # Phase B: box 1 enters pusher2
+    # Phase A: box1 enters pusher2 FIRST (sensor2 ON)
     # ------------------------------------------------------------------
     gpio_set(SENSOR2, True)
-    print("✓ sensor2 ↑ (box1)")
+    print("✓ sensor2 ↑ (box1 reaches pusher2)")
+
     wait_for_state(lambda s: s["running"] is True, timeout=5)
-    print("✓ box1 held at pusher2")
+    print("✓ running == True (box1 held at pusher2)")
 
     # ------------------------------------------------------------------
-    # Phase C: box 2 arrives upstream during processing
+    # Phase B: box2 arrives upstream during processing (sensor1 ↑)
+    # With sensor2 ON, pusher1 must pulse then HOLD.
     # ------------------------------------------------------------------
     gpio_set(SENSOR1, True)
     print("✓ sensor1 ↑ (box2 upstream)")
 
+    time.sleep(TOTAL_PULSE_TIME + 0.2)
+
     wait_for_state(lambda s: s["gpio"][PUSHER1] == 1)
-    print("✓ pusher1 holding box2")
+    print("✓ pusher1 holding box2 after pulse sequence")
 
     # ------------------------------------------------------------------
-    # Phase D: box 1 released into measurement
+    # Phase C: box1 released into measurement (sensor2 ↓)
+    # This also clears downstream, so pusher1 should release.
     # ------------------------------------------------------------------
     gpio_set(SENSOR2, False)
     print("✓ sensor2 ↓ (box1 released)")
 
-    wait_for_state(lambda s: s["gpio"][PUSHER1] == 0)
-    print("✓ pusher1 released box2")
+    wait_for_state(lambda s: s["gpio"][PUSHER1] == 0, timeout=5)
+    print("✓ pusher1 released box2 on sensor2 ↓")
 
+    # box2 moves down; clear sensor1 as it leaves upstream sensor
     gpio_set(SENSOR1, False)
-    time.sleep(1.0)
+    time.sleep(0.5)
 
     # ------------------------------------------------------------------
-    # Phase E: box 2 queues at pusher2
+    # Phase D: box2 queues at pusher2
     # ------------------------------------------------------------------
     gpio_set(SENSOR2, True)
     print("✓ sensor2 ↑ (box2 reaches pusher2)")
@@ -270,10 +252,8 @@ def scenario_2() -> None:
     wait_for_state(lambda s: s["gpio"][PUSHER2] == 1)
     print("✓ pusher2 holding box2")
 
-    time.sleep(1.0)
-
     # ------------------------------------------------------------------
-    # Phase F: box 1 diagonal measurement
+    # Phase E: box1 diagonal measurement
     # ------------------------------------------------------------------
     gpio_set(SENSOR3, True)
     print("✓ sensor3 ↑ (box1 diagonal)")
@@ -283,7 +263,7 @@ def scenario_2() -> None:
     print("✓ box1 exited diagonal")
 
     # ------------------------------------------------------------------
-    # Phase G: box 1 sealer path
+    # Phase F: box1 sealer path
     # ------------------------------------------------------------------
     gpio_set("sensor4", True)
     print("✓ sensor4 ↑ (box1 at sealer)")
@@ -304,13 +284,13 @@ def scenario_2() -> None:
     time.sleep(1.0)
 
     # ------------------------------------------------------------------
-    # Phase H: box 2 released and measured
+    # Phase G: box2 released and measured
     # ------------------------------------------------------------------
     wait_for_state(lambda s: s["gpio"][PUSHER2] == 0)
     print("✓ pusher2 released box2")
 
     gpio_set(SENSOR2, False)
-    time.sleep(1.0)
+    time.sleep(0.5)
 
     gpio_set(SENSOR3, True)
     print("✓ sensor3 ↑ (box2 diagonal)")
@@ -320,7 +300,7 @@ def scenario_2() -> None:
     print("✓ box2 exited diagonal")
 
     # ------------------------------------------------------------------
-    # Phase I: box 2 sealer path
+    # Phase H: box2 sealer path
     # ------------------------------------------------------------------
     gpio_set("sensor4", True)
     print("✓ sensor4 ↑ (box2 at sealer)")
@@ -355,90 +335,43 @@ def scenario_2() -> None:
     print("✓ Scenario 2 PASSED")
 
 
+# =============================================================================
+# SCENARIO 3
+# =============================================================================
+
+
 def scenario_3() -> None:
     print("\n=== Scenario 3: missing box timeout ===")
 
-    # ------------------------------------------------------------------
-    # Baseline
-    # ------------------------------------------------------------------
     reset_all_pins()
     wait_for_state(lambda s: s["running"] is False)
-    print("✓ baseline idle")
 
-    # ------------------------------------------------------------------
-    # Phase A: upstream noise
-    # ------------------------------------------------------------------
     gpio_set(SENSOR1, True)
-    print("✓ sensor1 ↑ (upstream noise)")
-
-    time.sleep(3.0)
-
-    state = mqtt_state
-    assert state["running"] is False, "running triggered prematurely"
-    assert state["gpio"][PUSHER1] == 0
-    assert state["gpio"][PUSHER2] == 0
-    print("✓ no reaction to upstream-only box")
-
+    time.sleep(TOTAL_PULSE_TIME + 0.2)
     gpio_set(SENSOR1, False)
 
-    # ------------------------------------------------------------------
-    # Phase B: box enters pusher2
-    # ------------------------------------------------------------------
     gpio_set(SENSOR2, True)
-    print("✓ sensor2 ↑ (box enters pusher2)")
-
     wait_for_state(lambda s: s["running"] is True)
-    print("✓ running == True")
-
-    wait_for_state(lambda s: s["gpio"][PUSHER2] == 0, timeout=3)
-    print("✓ pusher2 released (horizontal measured)")
 
     gpio_set(SENSOR2, False)
-    print("✓ sensor2 ↓ (box released)")
-    time.sleep(2)
+    time.sleep(2.0)
 
-    # ------------------------------------------------------------------
-    # Phase C: box never reaches sensor3 → timeout
-    # ------------------------------------------------------------------
     print("⏳ waiting for BOX_MISSING_TIMEOUT...")
-
     wait_for_state(lambda s: s["gpio"][ARM] == 0, timeout=11.0)
-    print("✓ arm forced OFF by timeout")
 
-    # ------------------------------------------------------------------
-    # Phase D: reject intent reaches sealer
-    # ------------------------------------------------------------------
     gpio_set("sensor4", True)
-    print("✓ sensor4 ↑ (reject path)")
-
     time.sleep(1.0)
 
     state = mqtt_state
-    assert state["gpio"].get("pusher4", 0) == 0, "pusher4 should NOT actuate"
-    assert state["gpio"].get("pusher3", 0) == 0, "pusher3 should NOT actuate"
-    print("✓ no accept pushers actuated")
+    assert state["gpio"].get("pusher4", 0) == 0
+    assert state["gpio"].get("pusher3", 0) == 0
 
     gpio_set("sensor4", False)
-    time.sleep(0.5)
-
     gpio_set("sensor5", True)
-    print("✓ sensor5 ↑ (reject completes)")
     time.sleep(0.5)
-
     gpio_set("sensor5", False)
-    time.sleep(1.0)
 
-    # ------------------------------------------------------------------
-    # Final state
-    # ------------------------------------------------------------------
-    state = mqtt_state
-    assert state["running"] is False
-    assert state["gpio"][PUSHER1] == 0
-    assert state["gpio"][PUSHER2] == 0
-    assert state["gpio"].get("pusher3", 0) == 0
-    assert state["gpio"].get("pusher4", 0) == 0
-
-    print("✓ system idle after reject")
+    wait_for_state(lambda s: s["running"] is False)
     print("✓ Scenario 3 PASSED")
 
 

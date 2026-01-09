@@ -61,6 +61,11 @@ SENSOR_2 = "sensor2"
 PUSHER_1 = "pusher1"
 
 
+# --- Timing ------------------------------------------------------------------
+PUSHER_ON_SEC = 0.50
+PUSHER_OFF_SEC = 0.40
+PUSHER_PULSES = 3
+
 # =============================================================================
 # STATE
 # =============================================================================
@@ -138,12 +143,38 @@ async def gpio_listener(
         # ---------------------------------------------------------------------
         # Rule 1:
         # sensor1 ↑ AND sensor2 ON -> pusher1 ON
+        # if downstream clear (sensor2 OFF), immediately release
         # ---------------------------------------------------------------------
-        if rising_edge(last_pins[SENSOR_1], s1) and s2 == 1:
+
+        if rising_edge(last_pins[SENSOR_1], s1):
             if pusher1_state == 0:
-                log.info("sensor1 ↑ and sensor2 ON -> pusher1 ON")
-                await gpio_set(gpio_req, PUSHER_1, True)
-                pusher1_state = 1
+                log.info("sensor1 ↑ -> pusher1 PULSE x3")
+
+                # --- 3 pulses ---
+                for i in range(PUSHER_PULSES):
+                    log.info("pusher1 ON (pulse %d)", i + 1)
+                    await gpio_set(gpio_req, PUSHER_1, True)
+                    pusher1_state = 1
+                    await asyncio.sleep(PUSHER_ON_SEC)
+
+                    log.info("pusher1 OFF (pulse %d)", i + 1)
+                    await gpio_set(gpio_req, PUSHER_1, False)
+                    pusher1_state = 0
+
+                    if i < PUSHER_PULSES - 1:
+                        await asyncio.sleep(PUSHER_OFF_SEC)
+
+                # --- final state decision ---
+                if s2 == 1:
+                    log.info(
+                        "downstream blocked (sensor2 ON) -> holding pusher1 ON"
+                    )
+                    await gpio_set(gpio_req, PUSHER_1, True)
+                    pusher1_state = 1
+                else:
+                    log.info(
+                        "downstream clear (sensor2 OFF) -> pusher1 remains OFF"
+                    )
 
         # ---------------------------------------------------------------------
         # Rule 2:

@@ -2,12 +2,13 @@
 """
 Comprehensive integration test for pusher microservice.
 
-Tests:
-- Heartbeat presence (service liveness)
-- GPIO status visibility
-- All edge combinations of sensor1 / sensor2
-- Correct pusher1 ON/OFF behavior
-- No false positives
+Updated contract:
+- On sensor1 rising edge:
+    * pusher pulses 3 times (ON/OFF)
+    * after pulses:
+        - sensor2 ON  -> pusher1 held ON
+        - sensor2 OFF -> pusher1 OFF
+- sensor2 falling edge releases held pusher
 """
 
 from __future__ import annotations
@@ -34,6 +35,15 @@ PUSHER_HEARTBEAT_TOPIC = b"pusher.heartbeat"
 RECV_TIMEOUT_MS = 2000
 HEARTBEAT_TIMEOUT_SEC = 3.0
 STATE_PROPAGATION_SEC = 1.0
+
+# --- must match pusher service ---
+PUSHER_ON_SEC = 0.50
+PUSHER_OFF_SEC = 0.40
+PUSHER_PULSES = 3
+
+TOTAL_PULSE_TIME = (
+    PUSHER_PULSES * PUSHER_ON_SEC + (PUSHER_PULSES - 1) * PUSHER_OFF_SEC
+)
 
 SENSOR1 = "sensor1"
 SENSOR2 = "sensor2"
@@ -100,13 +110,15 @@ def gpio_set(pin: str, value: bool) -> None:
     assert reply["ok"] is True
 
 
-def wait_for_pusher(expected: int) -> None:
+def wait_for_final_pusher(expected: int) -> None:
     deadline = time.time() + STATE_PROPAGATION_SEC
     while time.time() < deadline:
         state = get_gpio_state()
         if state[PUSHER1] == expected:
             return
-    raise AssertionError(f"Pusher1 did not reach expected state {expected}")
+    raise AssertionError(
+        f"Pusher1 did not settle to expected state {expected}"
+    )
 
 
 def wait_for_baseline() -> None:
@@ -124,17 +136,10 @@ def wait_for_baseline() -> None:
 
 
 def test_sensor_combinations() -> None:
-    """
-    Truth table (edge-based):
-
-    sensor1 ↑ AND sensor2 == 1  -> pusher1 ON
-    sensor2 ↓ AND pusher1 == 1 -> pusher1 OFF
-    """
-
-    print("Running sensor edge tests")
+    print("Running sensor sequence tests")
 
     # -------------------------------------------------------------------------
-    # Establish known baseline BEFORE edges
+    # Establish baseline
     # -------------------------------------------------------------------------
     gpio_set(SENSOR1, False)
     gpio_set(SENSOR2, False)
@@ -145,56 +150,60 @@ def test_sensor_combinations() -> None:
 
     # -------------------------------------------------------------------------
     # Case 1:
-    # sensor1 ↑ while sensor2 == 0 → NO ACTION
+    # sensor1 ↑ while sensor2 OFF
+    # pulses then releases
     # -------------------------------------------------------------------------
     gpio_set(SENSOR1, True)
-    time.sleep(0.2)
-    wait_for_pusher(0)
-    print("✓ sensor1 ↑ with sensor2 OFF does nothing")
+    time.sleep(TOTAL_PULSE_TIME + 0.1)
+    wait_for_final_pusher(0)
+    print("✓ sensor1 ↑ with sensor2 OFF pulses then releases")
 
     # -------------------------------------------------------------------------
     # Case 2:
-    # sensor2 ON, sensor1 already ON → NO EDGE → NO ACTION
+    # sensor2 ON alone does nothing
     # -------------------------------------------------------------------------
     gpio_set(SENSOR2, True)
     time.sleep(0.2)
-    wait_for_pusher(0)
-    print("✓ sensor2 ON without sensor1 edge does nothing")
+    wait_for_final_pusher(0)
+    print("✓ sensor2 ON alone does nothing")
 
     # -------------------------------------------------------------------------
     # Case 3:
-    # sensor1 ↓ then ↑ while sensor2 ON → PUSHER ON
+    # sensor1 ↓ then ↑ while sensor2 ON
+    # pulses then holds
     # -------------------------------------------------------------------------
     gpio_set(SENSOR1, False)
     time.sleep(0.1)
     gpio_set(SENSOR1, True)
-    wait_for_pusher(1)
-    print("✓ sensor1 ↑ while sensor2 ON turns pusher ON")
+
+    time.sleep(TOTAL_PULSE_TIME + 0.1)
+    wait_for_final_pusher(1)
+    print("✓ sensor1 ↑ with sensor2 ON pulses then holds")
 
     # -------------------------------------------------------------------------
     # Case 4:
-    # sensor1 ↓ while sensor2 ON → NO EFFECT
+    # sensor1 ↓ does not affect held pusher
     # -------------------------------------------------------------------------
     gpio_set(SENSOR1, False)
     time.sleep(0.2)
-    wait_for_pusher(1)
-    print("✓ sensor1 ↓ does not affect pusher")
+    wait_for_final_pusher(1)
+    print("✓ sensor1 ↓ does not affect held pusher")
 
     # -------------------------------------------------------------------------
     # Case 5:
-    # sensor2 ↓ while pusher ON → PUSHER OFF
+    # sensor2 ↓ releases held pusher
     # -------------------------------------------------------------------------
     gpio_set(SENSOR2, False)
-    wait_for_pusher(0)
-    print("✓ sensor2 ↓ turns pusher OFF")
+    wait_for_final_pusher(0)
+    print("✓ sensor2 ↓ releases held pusher")
 
     # -------------------------------------------------------------------------
     # Case 6:
-    # sensor2 ↑ again → NO EFFECT
+    # sensor2 ↑ alone does nothing
     # -------------------------------------------------------------------------
     gpio_set(SENSOR2, True)
     time.sleep(0.2)
-    wait_for_pusher(0)
+    wait_for_final_pusher(0)
     print("✓ sensor2 ↑ alone does nothing")
 
 
